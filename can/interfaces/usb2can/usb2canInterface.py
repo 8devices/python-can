@@ -3,8 +3,8 @@ This interface is for Windows only, otherwise use SocketCAN.
 """
 
 import logging
-from ctypes import byref
-from typing import Optional
+import ctypes 
+from typing import Optional, cast
 
 from can import BusABC, Message, CanInitializationError, CanOperationError
 from .usb2canabstractionlayer import Usb2CanAbstractionLayer, CanalMsg, CanalError
@@ -14,6 +14,7 @@ from .usb2canabstractionlayer import (
     IS_ID_TYPE,
 )
 from .serial_selector import find_serial_devices
+from can.typechecking import CanFilters, CanFilterExtended
 
 # Set up logging
 log = logging.getLogger("can.usb2can")
@@ -87,6 +88,9 @@ class Usb2canBus(BusABC):
         If both `serial` and `channel` are set, `serial` will be used and
         channel will be ignored.
 
+    :param can_filters (optional):
+        See :meth:`can.BusABC.set_filters`.
+
     """
 
     def __init__(
@@ -96,9 +100,10 @@ class Usb2canBus(BusABC):
         flags=0x00000008,
         *_,
         bitrate=500000,
+        can_filters: Optional[CanFilters] = None,
         **kwargs,
     ):
-
+        self._is_filtered = False
         self.can = Usb2CanAbstractionLayer(dll)
 
         # get the serial number of the device
@@ -119,15 +124,15 @@ class Usb2canBus(BusABC):
         connector = f"{device_id}; {baudrate}"
         self.handle = self.can.open(connector, flags)
 
-        super().__init__(channel=channel, **kwargs)
+        super().__init__(channel=channel, can_filters=can_filters, **kwargs)
 
     def send(self, msg, timeout=None):
         tx = message_convert_tx(msg)
 
         if timeout:
-            status = self.can.blocking_send(self.handle, byref(tx), int(timeout * 1000))
+            status = self.can.blocking_send(self.handle, ctypes.byref(tx), int(timeout * 1000))
         else:
-            status = self.can.send(self.handle, byref(tx))
+            status = self.can.send(self.handle, ctypes.byref(tx))
 
         if status != CanalError.SUCCESS:
             raise CanOperationError("could not send message", error_code=status)
@@ -137,11 +142,11 @@ class Usb2canBus(BusABC):
         messagerx = CanalMsg()
 
         if timeout == 0:
-            status = self.can.receive(self.handle, byref(messagerx))
+            status = self.can.receive(self.handle, ctypes.byref(messagerx))
 
         else:
             time = 0 if timeout is None else int(timeout * 1000)
-            status = self.can.blocking_receive(self.handle, byref(messagerx), time)
+            status = self.can.blocking_receive(self.handle, ctypes.byref(messagerx), time)
 
         if status == CanalError.SUCCESS:
             rx = message_convert_rx(messagerx)
@@ -154,7 +159,31 @@ class Usb2canBus(BusABC):
         else:
             raise CanOperationError("could not receive message", error_code=status)
 
-        return rx, False
+        return rx, self._is_filtered
+
+    def _apply_filters(self, can_filters: Optional[CanFilters]) -> None:
+        CAN_EXTENDED_FLAG = 0x80000000
+        if can_filters is None:
+            # Pass all messages
+            # can_filters = [{"can_id": 0, "can_mask": 0}]
+            self._is_filtered = False
+            return
+        filter_data = []
+        for can_filter in can_filters:
+            can_id = can_filter["can_id"]
+            can_mask = can_filter["can_mask"]
+            if "extended" in can_filter:
+                can_filter = cast(CanFilterExtended, can_filter)
+                # Match on either 11-bit OR 29-bit messages instead of both
+                can_mask |= CAN_EXTENDED_FLAG
+                if can_filter["extended"]:
+                    can_id |= CAN_EXTENDED_FLAG
+            filter_data.append(can_id)
+            filter_data.append(can_mask)
+        filter_len =len(filter_data)
+
+        self.can.set_filters(self.handle,ctypes.c_int(filter_len), (ctypes.c_ulong * filter_len)(*filter_data))
+        self._is_filtered = True
 
     def shutdown(self):
         """
